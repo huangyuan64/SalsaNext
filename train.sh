@@ -41,5 +41,8 @@ then
 else
   p=$(get_abs_filename "$p")
 fi
-export CUDA_VISIBLE_DEVICES="$c"
-cd ./train/tasks/semantic;  ./train.py -d "$d"  -ac "$a" -l "$l" -n "$n" -p "$p" -u "$u"
+
+export RANK_SIZE=1
+export ASCEND_RT_VISIBLE_DEVICES=$c
+cd ./train/tasks/semantic;
+./train.py -d "$d"  -ac "$a" -l "$l" -n "$n" -p "$p" -u "$u"

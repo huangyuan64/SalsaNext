@@ -18,7 +18,7 @@ import numbers
 import types
 from collections.abc import Sequence, Iterable
 import warnings
-
+import datasets
 
 EXTENSIONS_SCAN = ['.bin']
 EXTENSIONS_LABEL = ['.label']
@@ -291,6 +291,7 @@ class Parser():
                max_points,        # max points in each scan in entire dataset
                batch_size,        # batch size for train and val
                workers,           # threads to load data
+               distributed,
                gt=True,           # get gt?
                shuffle_train=True):  # shuffle training set?
     super(Parser, self).__init__()
@@ -308,6 +309,7 @@ class Parser():
     self.max_points = max_points
     self.batch_size = batch_size
     self.workers = workers
+    self.distributed = distributed
     self.gt = gt
     self.shuffle_train = shuffle_train
 
@@ -326,9 +328,18 @@ class Parser():
                                        transform=True,
                                        gt=self.gt)
 
+    if self.distributed:
+        if False:
+            sampler_train = torch.utils.data.distributed.NodeDistributedSampler(self.train_dataset)
+        else:
+            sampler_train = torch.utils.data.distributed.DistributedSampler(self.train_dataset)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(self.train_dataset)
+    self.sampler_train = sampler_train
+
     self.trainloader = torch.utils.data.DataLoader(self.train_dataset,
                                                    batch_size=self.batch_size,
-                                                   shuffle=self.shuffle_train,
+                                                   sampler=self.sampler_train,
                                                    num_workers=self.workers,
                                                    drop_last=True)
     assert len(self.trainloader) > 0
@@ -343,9 +354,17 @@ class Parser():
                                        sensor=self.sensor,
                                        max_points=max_points,
                                        gt=self.gt)
+    if self.distributed:
+        if False:
+            sampler_val = torch.utils.data.distributed.NodeDistributedSampler(self.valid_dataset, shuffle=False)
+        else:
+            sampler_val = torch.utils.data.distributed.DistributedSampler(self.valid_dataset, shuffle=False)
+    else:
+        sampler_val = torch.utils.data.SequentialSampler(self.valid_dataset)
 
     self.validloader = torch.utils.data.DataLoader(self.valid_dataset,
                                                    batch_size=self.batch_size,
+                                                   sampler=sampler_val,
                                                    shuffle=False,
                                                    num_workers=self.workers,
                                                    drop_last=True)
@@ -363,13 +382,25 @@ class Parser():
                                         max_points=max_points,
                                         gt=False)
 
+      if self.distributed:
+          if False:
+              sampler_test = torch.utils.data.distributed.NodeDistributedSampler(self.test_dataset, shuffle=False)
+          else:
+              sampler_test = torch.utils.data.distributed.DistributedSampler(self.test_dataset, shuffle=False)
+      else:
+          sampler_test = torch.utils.data.SequentialSampler(self.test_dataset)
+
       self.testloader = torch.utils.data.DataLoader(self.test_dataset,
                                                     batch_size=self.batch_size,
+                                                    sampler=sampler_test,
                                                     shuffle=False,
                                                     num_workers=self.workers,
                                                     drop_last=True)
       assert len(self.testloader) > 0
       self.testiter = iter(self.testloader)
+
+  def get_sampler_train(self):
+    return self.sampler_train
 
   def get_train_batch(self):
     scans = self.trainiter.next()

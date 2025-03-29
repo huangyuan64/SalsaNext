@@ -6,6 +6,8 @@ import time
 import imp
 import cv2
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 
@@ -21,6 +23,9 @@ from tasks.semantic.modules.SalsaNext import *
 from tasks.semantic.modules.SalsaNextAdf import *
 from tasks.semantic.modules.Lovasz_Softmax import Lovasz_softmax
 import tasks.semantic.modules.adf as adf
+
+import argparse
+import random
 
 def keep_variance_fn(x):
     return x + 1e-3
@@ -53,6 +58,19 @@ def save_to_log(logdir, logfile, message):
     f.close()
     return
 
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 def save_checkpoint(to_save, logdir, suffix=""):
     # Save the weights
@@ -61,7 +79,7 @@ def save_checkpoint(to_save, logdir, suffix=""):
 
 
 class Trainer():
-    def __init__(self, ARCH, DATA, datadir, logdir, path=None,uncertainty=False):
+    def __init__(self, ARCH, DATA, datadir, logdir, path=None, uncertainty=False, max_epochs=None):
         # parameters
         self.ARCH = ARCH
         self.DATA = DATA
@@ -75,6 +93,15 @@ class Trainer():
         self.batch_time_e = AverageMeter()
         self.epoch = 0
 
+        self.gpu_id = 0
+
+        if max_epochs is not None:
+            self.max_epochs = max_epochs
+        else:
+            self.max_epochs = self.ARCH['train']['max_epochs']
+
+        self.batch_size = self.ARCH["train"]["batch_size"]
+
         # put logger where it belongs
 
         self.info = {"train_update": 0,
@@ -86,6 +113,8 @@ class Trainer():
                      "valid_iou": 0,
                      "best_train_iou": 0,
                      "best_val_iou": 0}
+
+        self.distributed = self.init_distributed_mode()
 
         # get the data
         parserModule = imp.load_source("parserModule",
@@ -101,8 +130,9 @@ class Trainer():
                                           learning_map_inv=self.DATA["learning_map_inv"],
                                           sensor=self.ARCH["dataset"]["sensor"],
                                           max_points=self.ARCH["dataset"]["max_points"],
-                                          batch_size=self.ARCH["train"]["batch_size"],
+                                          batch_size=self.batch_size,
                                           workers=self.ARCH["train"]["workers"],
+                                          distributed=self.distributed,
                                           gt=True,
                                           shuffle_train=True)
 
@@ -128,37 +158,41 @@ class Trainer():
 
         self.tb_logger = Logger(self.log + "/tb")
 
-        # GPU?
-        self.gpu = False
-        self.multi_gpu = False
-        self.n_gpus = 0
-        self.model_single = self.model
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("Training in device: ", self.device)
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            cudnn.benchmark = True
-            cudnn.fastest = True
-            self.gpu = True
-            self.n_gpus = 1
-            self.model.cuda()
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            print("Let's use", torch.cuda.device_count(), "GPUs!")
-            self.model = nn.DataParallel(self.model)  # spread in gpus
-            self.model = convert_model(self.model).cuda()  # sync batchnorm
-            self.model_single = self.model.module  # single model to get weight names
-            self.multi_gpu = True
-            self.n_gpus = torch.cuda.device_count()
-
+        device = torch.device("npu")
+        self.device = device
 
         self.criterion = nn.NLLLoss(weight=self.loss_w).to(self.device)
         self.ls = Lovasz_softmax(ignore=0).to(self.device)
         self.SoftmaxHeteroscedasticLoss = SoftmaxHeteroscedasticLoss().to(self.device)
-        # loss as dataparallel too (more images in batch)
-        if self.n_gpus > 1:
-            self.criterion = nn.DataParallel(self.criterion).cuda()  # spread in gpus
-            self.ls = nn.DataParallel(self.ls).cuda()
-            self.SoftmaxHeteroscedasticLoss = nn.DataParallel(self.SoftmaxHeteroscedasticLoss).cuda()
-        self.optimizer = optim.SGD([{'params': self.model.parameters()}],
+        self.model.to(self.device)
+        # dataLoad
+        self.sampler_train = self.parser.get_sampler_train()
+
+        model_without_ddp = self.model
+        n_parameters = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        self.gpu = False
+        self.multi_gpu = False
+        self.n_gpus = 0
+        self.model_single = self.model
+        self.device = torch.device("npu")
+        print("Training in device: ", self.device)
+        if torch.npu.is_available() and torch.npu.device_count() > 0:
+            cudnn.benchmark = True
+            cudnn.fastest = True
+            self.gpu = True
+            self.n_gpus = 1
+            self.model.to(device)
+        if self.distributed:
+            print("Let's use", torch.npu.device_count(), "NPUs!")
+
+            # ****************************FIX********************
+            self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.gpu_id])
+            self.model_single = self.model.module  # single model to get weight names
+            self.multi_gpu = True
+            self.n_gpus = torch.npu.device_count()
+
+        self.optimizer = torch_npu.optim.NpuFusedSGD([{'params': self.model.parameters()}],
                                    lr=self.ARCH["train"]["lr"],
                                    momentum=self.ARCH["train"]["momentum"],
                                    weight_decay=self.ARCH["train"]["w_decay"])
@@ -186,13 +220,55 @@ class Trainer():
             self.info = w_dict['info']
             print("info", w_dict['info'])
 
+    def init_distributed_mode(self):
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ['WORLD_SIZE'])
+            gpu = int(os.environ['LOCAL_RANK'])
+            dist_url = 'env://'
+            os.environ['LOCAL_SIZE'] = str(torch.npu.device_count())
+        elif 'SLURM_PROCID' in os.environ:
+            proc_id = int(os.environ['SLURM_PROCID'])
+            ntasks = int(os.environ['SLURM_NTASKS'])
+            node_list = os.environ['SLURM_NODELIST']
+            num_gpus = torch.npu.device_count()
+            addr = subprocess.getoutput(
+                'scontrol show hostname {} | head -n1'.format(node_list))
+            os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29501')
+            os.environ['MASTER_ADDR'] = addr
+            os.environ['WORLD_SIZE'] = str(ntasks)
+            os.environ['RANK'] = str(proc_id)
+            os.environ['LOCAL_RANK'] = str(proc_id % num_gpus)
+            os.environ['LOCAL_SIZE'] = str(num_gpus)
+            dist_url = 'env://'
+            world_size = ntasks
+            rank = proc_id
+            gpu = proc_id % num_gpus
+        else:
+            distributed = False
+            return False
+
+        distributed = True
+        self.gpu_id = gpu
+
+        torch.npu.set_device(gpu)
+        dist_backend = 'nccl'
+        print('| distributed init (rank {}): {}'.format(
+            rank, dist_url), flush=True)
+        torch.distributed.init_process_group(backend=dist_backend, init_method=dist_url,
+                                            world_size=world_size, rank=rank)
+        torch.distributed.barrier()
+        setup_for_distributed(rank == 0)
+
+        return True
+
 
     def calculate_estimate(self, epoch, iter):
         estimate = int((self.data_time_t.avg + self.batch_time_t.avg) * \
-                       (self.parser.get_train_size() * self.ARCH['train']['max_epochs'] - (
+                       (self.parser.get_train_size() * self.max_epochs - (
                                iter + 1 + epoch * self.parser.get_train_size()))) + \
                    int(self.batch_time_e.avg * self.parser.get_valid_size() * (
-                           self.ARCH['train']['max_epochs'] - (epoch)))
+                           self.max_epochs - (epoch)))
         return str(datetime.timedelta(seconds=estimate))
 
     @staticmethod
@@ -255,8 +331,9 @@ class Trainer():
                                  self.device, self.ignore_class)
 
         # train for n epochs
-        for epoch in range(self.epoch, self.ARCH["train"]["max_epochs"]):
-
+        for epoch in range(self.epoch, self.max_epochs):
+            if self.distributed:
+                self.sampler_train.set_epoch(epoch)
             # train for 1 epoch
             acc, iou, loss, update_mean,hetero_l = self.train_epoch(train_loader=self.parser.get_train_set(),
                                                            model=self.model,
@@ -351,20 +428,23 @@ class Trainer():
 
         # empty the cache to train now
         if self.gpu:
-            torch.cuda.empty_cache()
+            torch.npu.empty_cache()
 
         # switch to train mode
         model.train()
+        device = self.device
 
         end = time.time()
+        train_loader_len = len(train_loader)
+
         for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name, _, _, _, _, _, _, _, _, _) in enumerate(train_loader):
             # measure data loading time
             self.data_time_t.update(time.time() - end)
             if not self.multi_gpu and self.gpu:
-                in_vol = in_vol.cuda()
-                #proj_mask = proj_mask.cuda()
+                in_vol = in_vol.to(device)
+                #proj_mask = proj_mask.to(device)
             if self.gpu:
-                proj_labels = proj_labels.cuda().long()
+                proj_labels = proj_labels.to(device).long()
 
             # compute output
             if self.uncertainty:
@@ -378,13 +458,9 @@ class Trainer():
             else:
                 output = model(in_vol)
                 loss_m = criterion(torch.log(output.clamp(min=1e-8)), proj_labels) + self.ls(output, proj_labels.long())
-
             optimizer.zero_grad()
-            if self.n_gpus > 1:
-                idx = torch.ones(self.n_gpus).cuda()
-                loss_m.backward(idx)
-            else:
-                loss_m.backward()
+
+            loss_m.backward()
             optimizer.step()
 
             # measure accuracy and record loss
@@ -407,18 +483,19 @@ class Trainer():
             # get gradient updates and weights, so I can print the relationship of
             # their norms
             update_ratios = []
-            for g in self.optimizer.param_groups:
-                lr = g["lr"]
-                for value in g["params"]:
-                    if value.grad is not None:
-                        w = np.linalg.norm(value.data.cpu().numpy().reshape((-1)))
-                        update = np.linalg.norm(-max(lr, 1e-10) *
-                                                value.grad.cpu().numpy().reshape((-1)))
-                        update_ratios.append(update / max(w, 1e-10))
-            update_ratios = np.array(update_ratios)
-            update_mean = update_ratios.mean()
-            update_std = update_ratios.std()
-            update_ratio_meter.update(update_mean)  # over the epoch
+            if i % self.ARCH["train"]["report_batch"] == 0 or i == train_loader_len - 1:
+                for g in self.optimizer.param_groups:
+                    lr = g["lr"]
+                    for value in g["params"]:
+                        if value.grad is not None:
+                            w = np.linalg.norm(value.data.cpu().numpy().reshape((-1)))
+                            update = np.linalg.norm(-max(lr, 1e-10) *
+                                                    value.grad.cpu().numpy().reshape((-1)))
+                            update_ratios.append(update / max(w, 1e-10))
+                update_ratios = np.array(update_ratios)
+                update_mean = update_ratios.mean()
+                update_std = update_ratios.std()
+                update_ratio_meter.update(update_mean)  # over the epoch
 
             if show_scans:
                 # get the first scan in batch and project points
@@ -441,53 +518,53 @@ class Trainer():
 
                 if i % self.ARCH["train"]["report_batch"] == 0:
                     print( 'Lr: {lr:.3e} | '
-                          'Update: {umean:.3e} mean,{ustd:.3e} std | '
-                          'Epoch: [{0}][{1}/{2}] | '
-                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
-                          'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
-                          'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
-                          'Hetero {hetero_l.val:.4f} ({hetero_l.avg:.4f}) | '
-                          'acc {acc.val:.3f} ({acc.avg:.3f}) | '
-                          'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
-                        epoch, i, len(train_loader), batch_time=self.batch_time_t,
+                        'Update: {umean:.3e} mean,{ustd:.3e} std | '
+                        'Epoch: [{0}][{1}/{2}] | '
+                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
+                        'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
+                        'Hetero {hetero_l.val:.4f} ({hetero_l.avg:.4f}) | '
+                        'acc {acc.val:.3f} ({acc.avg:.3f}) | '
+                        'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
+                        epoch, i, train_loader_len, batch_time=self.batch_time_t,
                         data_time=self.data_time_t, loss=losses, hetero_l=hetero_l,acc=acc, iou=iou, lr=lr,
                         umean=update_mean, ustd=update_std, estim=self.calculate_estimate(epoch, i)))
 
                     save_to_log(self.log, 'log.txt', 'Lr: {lr:.3e} | '
-                          'Update: {umean:.3e} mean,{ustd:.3e} std | '
-                          'Epoch: [{0}][{1}/{2}] | '
-                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
-                          'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
-                          'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
-                          'Hetero {hetero.val:.4f} ({hetero.avg:.4f}) | '
-                          'acc {acc.val:.3f} ({acc.avg:.3f}) | '
-                          'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
-                        epoch, i, len(train_loader), batch_time=self.batch_time_t,
+                        'Update: {umean:.3e} mean,{ustd:.3e} std | '
+                        'Epoch: [{0}][{1}/{2}] | '
+                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
+                        'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
+                        'Hetero {hetero.val:.4f} ({hetero.avg:.4f}) | '
+                        'acc {acc.val:.3f} ({acc.avg:.3f}) | '
+                        'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
+                        epoch, i, train_loader_len, batch_time=self.batch_time_t,
                         data_time=self.data_time_t, loss=losses, hetero=hetero_l,acc=acc, iou=iou, lr=lr,
                         umean=update_mean, ustd=update_std, estim=self.calculate_estimate(epoch, i)))
             else:
                 if i % self.ARCH["train"]["report_batch"] == 0:
                     print('Lr: {lr:.3e} | '
-                          'Update: {umean:.3e} mean,{ustd:.3e} std | '
-                          'Epoch: [{0}][{1}/{2}] | '
-                          'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
-                          'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
-                          'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
-                          'acc {acc.val:.3f} ({acc.avg:.3f}) | '
-                          'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
-                        epoch, i, len(train_loader), batch_time=self.batch_time_t,
+                        'Update: {umean:.3e} mean,{ustd:.3e} std | '
+                        'Epoch: [{0}][{1}/{2}] | '
+                        'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
+                        'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
+                        'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
+                        'acc {acc.val:.3f} ({acc.avg:.3f}) | '
+                        'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
+                        epoch, i, train_loader_len, batch_time=self.batch_time_t,
                         data_time=self.data_time_t, loss=losses, acc=acc, iou=iou, lr=lr,
                         umean=update_mean, ustd=update_std, estim=self.calculate_estimate(epoch, i)))
 
                     save_to_log(self.log, 'log.txt', 'Lr: {lr:.3e} | '
-                                                     'Update: {umean:.3e} mean,{ustd:.3e} std | '
-                                                     'Epoch: [{0}][{1}/{2}] | '
-                                                     'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
-                                                     'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
-                                                     'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
-                                                     'acc {acc.val:.3f} ({acc.avg:.3f}) | '
-                                                     'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
-                        epoch, i, len(train_loader), batch_time=self.batch_time_t,
+                                                    'Update: {umean:.3e} mean,{ustd:.3e} std | '
+                                                    'Epoch: [{0}][{1}/{2}] | '
+                                                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
+                                                    'Data {data_time.val:.3f} ({data_time.avg:.3f}) | '
+                                                    'Loss {loss.val:.4f} ({loss.avg:.4f}) | '
+                                                    'acc {acc.val:.3f} ({acc.avg:.3f}) | '
+                                                    'IoU {iou.val:.3f} ({iou.avg:.3f}) | [{estim}]'.format(
+                        epoch, i, train_loader_len, batch_time=self.batch_time_t,
                         data_time=self.data_time_t, loss=losses, acc=acc, iou=iou, lr=lr,
                         umean=update_mean, ustd=update_std, estim=self.calculate_estimate(epoch, i)))
 
@@ -511,16 +588,16 @@ class Trainer():
 
         # empty the cache to infer in high res
         if self.gpu:
-            torch.cuda.empty_cache()
+            torch.npu.empty_cache()
 
         with torch.no_grad():
             end = time.time()
             for i, (in_vol, proj_mask, proj_labels, _, path_seq, path_name, _, _, _, _, _, _, _, _, _) in enumerate(val_loader):
                 if not self.multi_gpu and self.gpu:
-                    in_vol = in_vol.cuda()
-                    proj_mask = proj_mask.cuda()
+                    in_vol = in_vol.to(self.device)
+                    proj_mask = proj_mask.to(self.device)
                 if self.gpu:
-                    proj_labels = proj_labels.cuda(non_blocking=True).long()
+                    proj_labels = proj_labels.npu(non_blocking=True).long()
 
                 # compute output
                 if self.uncertainty:
@@ -639,6 +716,5 @@ class Trainer():
                     save_to_log(self.log, 'log.txt', 'IoU class {i:} [{class_str:}] = {jacc:.3f}'.format(
                         i=i, class_str=class_func(i), jacc=jacc))
                     self.info["valid_classes/" + class_func(i)] = jacc
-
 
         return acc.avg, iou.avg, losses.avg, rand_imgs, hetero_l.avg

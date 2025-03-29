@@ -77,13 +77,13 @@ class User():
     # GPU?
     self.gpu = False
     self.model_single = self.model
-    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.device = torch.device("cuda" if torch.npu.is_available() else "cpu")
     print("Infering in device: ", self.device)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    if torch.npu.is_available() and torch.npu.device_count() > 0:
       cudnn.benchmark = True
       cudnn.fastest = True
       self.gpu = True
-      self.model.cuda()
+      self.model.npu()
 
   def infer(self):
     cnn = []
@@ -125,7 +125,7 @@ class User():
     total_frames=0
     # empty the cache to infer in high res
     if self.gpu:
-      torch.cuda.empty_cache()
+      torch.npu.empty_cache()
 
     with torch.no_grad():
       end = time.time()
@@ -140,12 +140,12 @@ class User():
         path_name = path_name[0]
 
         if self.gpu:
-          proj_in = proj_in.cuda()
-          p_x = p_x.cuda()
-          p_y = p_y.cuda()
+          proj_in = proj_in.npu()
+          p_x = p_x.npu()
+          p_y = p_y.npu()
           if self.post:
-            proj_range = proj_range.cuda()
-            unproj_range = unproj_range.cuda()
+            proj_range = proj_range.npu()
+            unproj_range = unproj_range.npu()
 
         #compute output
         if self.uncertainty:
@@ -170,8 +170,8 @@ class User():
                 unproj_argmax = proj_argmax[p_y, p_x]
 
             # measure elapsed time
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             frame_time = time.time() - end
             print("Infered seq", path_seq, "scan", path_name,
                   "in", frame_time, "sec")
@@ -225,16 +225,16 @@ class User():
         else:
             proj_output = self.model(proj_in)
             proj_argmax = proj_output[0].argmax(dim=0)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             res = time.time() - end
             print("Network seq", path_seq, "scan", path_name,
                   "in", res, "sec")
             end = time.time()
             cnn.append(res)
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             res = time.time() - end
             print("Network seq", path_seq, "scan", path_name,
                   "in", res, "sec")
@@ -253,8 +253,8 @@ class User():
                 unproj_argmax = proj_argmax[p_y, p_x]
 
             # measure elapsed time
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             res = time.time() - end
             print("KNN Infered seq", path_seq, "scan", path_name,
                   "in", res, "sec")
