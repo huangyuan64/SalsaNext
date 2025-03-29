@@ -17,6 +17,11 @@ from tasks.semantic.modules.SalsaNext import *
 import math
 from decimal import Decimal
 
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+from tasks.semantic.patch import salsa_next_patcher_builder
+
 def remove_exponent(d):
     return d.quantize(Decimal(1)) if d == d.to_integral() else d.normalize()
 
@@ -90,6 +95,13 @@ if __name__ == '__main__':
         const=True, default=False,
         help='Set this if you want to use the Uncertainty Version'
     )
+    parser.add_argument(
+        '--max_epochs', '-me',
+        type=int,
+        required=False,
+        default=None,
+        help='Set this if you want to give special epoch num'
+    )
 
     FLAGS, unparsed = parser.parse_known_args()
     FLAGS.log = FLAGS.log + '/logs/' + datetime.datetime.now().strftime("%Y-%-m-%d-%H:%M") + FLAGS.name
@@ -138,7 +150,7 @@ if __name__ == '__main__':
             FLAGS.pretrained = None
             if os.path.isdir(FLAGS.log):
                 if os.listdir(FLAGS.log):
-                    answer = raw_input("Log Directory is not empty. Do you want to proceed? [y/n]  ")
+                    answer = 'y'
                     if answer == 'n':
                         quit()
                     else:
@@ -173,5 +185,6 @@ if __name__ == '__main__':
         quit()
 
     # create trainer and start the training
-    trainer = Trainer(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.pretrained,FLAGS.uncertainty)
-    trainer.train()
+    with salsa_next_patcher_builder.build():
+        trainer = Trainer(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.pretrained, FLAGS.uncertainty, FLAGS.max_epochs)
+        trainer.train()

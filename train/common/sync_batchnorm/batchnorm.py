@@ -340,7 +340,8 @@ def convert_model(module):
         >>> # after convert, m is using SyncBN
         >>> m = convert_model(m)
     """
-    if isinstance(module, torch.nn.DataParallel):
+
+    if isinstance(module, torch.nn.parallel.DistributedDataParallel):
         mod = module.module
         mod = convert_model(mod)
         mod = DataParallelWithCallback(mod)
